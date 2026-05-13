@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Voice → Groq → Kokoro</title>
+  <style>
+    :root {
+      font-family: system-ui, sans-serif;
+      background: #0f1419;
+      color: #e7eef5;
+    }
+    body { max-width: 560px; margin: 2rem auto; padding: 0 1rem; }
+    h1 { font-size: 1.25rem; font-weight: 600; }
+    p.hint { color: #8b9bab; font-size: 0.9rem; line-height: 1.45; }
+    .row { display: flex; gap: 0.75rem; flex-wrap: wrap; align-items: center; margin: 1rem 0; }
+    button {
+      background: #3d8bfd;
+      color: #fff;
+      border: none;
+      padding: 0.65rem 1.1rem;
+      border-radius: 8px;
+      font-size: 1rem;
+      cursor: pointer;
+    }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    button.recording { background: #e5534b; }
+    .panel {
+      background: #1a2332;
+      border-radius: 10px;
+      padding: 1rem;
+      margin-top: 1rem;
+      min-height: 4rem;
+    }
+    .label { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.06em; color: #6b7c8f; margin-bottom: 0.35rem; }
+    audio { width: 100%; margin-top: 0.75rem; }
+    .status { font-size: 0.9rem; color: #a8bfd9; min-height: 1.25rem; }
+    .err { color: #ff8a8a; }
+    code { font-size: 0.82em; background: #0f1419; padding: 0.1em 0.35em; border-radius: 4px; }
+    input[type="file"] { font-size: 0.85rem; color: #a8bfd9; max-width: 100%; }
+    .rag-meta { font-size: 0.8rem; color: #6b7c8f; margin-top: 0.35rem; }
+  </style>
+</head>
+<body>
+  <h1>Talk to the assistant</h1>
+  <p class="hint">
+    Hold the button, speak, then release. The server converts browser audio to WAV with
+    <strong>ffmpeg</strong> before Groq STT (raw WebM is often rejected). Install:
+    <code>brew install ffmpeg</code> (macOS) or <code>apt install ffmpeg</code> (Linux).
+    <strong>Best:</strong> open <code>http://127.0.0.1:8765/</code> (same server as the API). If you use Live Server on another port, this page auto-targets <code>127.0.0.1:8765</code> for API calls.
+  </p>
+
+  <div class="panel">
+    <div class="label">RAG — upload PDF</div>
+    <p class="hint" style="margin-top:0">
+      Text is extracted with PyMuPDF; scanned pages use Tesseract OCR if little text is found (<code>brew install tesseract</code>).
+      Chunks are embedded with <strong>fastembed</strong> and stored in a local <strong>FAISS</strong> index under <code>voice_testing/data/rag/</code>. Voice questions retrieve matching chunks for Groq.
+    </p>
+    <div class="row">
+      <input type="file" id="pdfFile" accept=".pdf,application/pdf" />
+      <label style="display:flex;align-items:center;gap:0.35rem;font-size:0.9rem;color:#a8bfd9;">
+        <input type="checkbox" id="ragReplace" /> Replace entire index
+      </label>
+    </div>
+    <div class="row">
+      <button type="button" id="btnPdfUpload">Index PDF</button>
+    </div>
+    <div class="rag-meta" id="ragMeta"></div>
+  </div>
+
+  <div class="row">
+    <button type="button" id="btnRecord" aria-pressed="false">Hold to record</button>
+  </div>
+  <div class="status" id="status"></div>
+
+  <div class="panel">
+    <div class="label">You said</div>
+    <div id="transcript">—</div>
+  </div>
+  <div class="panel">
+    <div class="label">Assistant</div>
+    <div id="reply">—</div>
+    <audio id="player" controls playsinline></audio>
+  </div>
+
+  <script>
+    const btn = document.getElementById("btnRecord");
+    const statusEl = document.getElementById("status");
+    const transcriptEl = document.getElementById("transcript");
+    const replyEl = document.getElementById("reply");
+    const player = document.getElementById("player");
+    const pdfFile = document.getElementById("pdfFile");
+    const btnPdfUpload = document.getElementById("btnPdfUpload");
+    const ragReplace = document.getElementById("ragReplace");
+    const ragMeta = document.getElementById("ragMeta");
+
+    /** Backend base (no trailing slash). Empty = same origin as this page. */
+    const API_BASE = (() => {
+      const q = new URLSearchParams(location.search).get("api");
+      if (q) return q.replace(/\/$/, "");
+      const host = location.hostname;
+      const port = location.port;
+      const isLocal = host === "127.0.0.1" || host === "localhost";
+      if (isLocal && port && port !== "8765")
+        return "http://127.0.0.1:8765";
+      return "";
+    })();
+
+    function apiUrl(path) {
+      return `${API_BASE}${path.startsWith("/") ? path : "/" + path}`;
+    }
+
+    let mediaRecorder = null;
+    let chunks = [];
+    let audioCtx = null;
+    let recordingPointerId = null;
+    let stopInFlight = false;
+
+    function setStatus(msg, isError = false) {
+      statusEl.textContent = msg;
+      statusEl.className = "status" + (isError ? " err" : "");
+    }
+
+    function getAudioContext() {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return null;
+      if (!audioCtx) audioCtx = new AC();
+      return audioCtx;
+    }
+
+    /** Resume AudioContext in the same gesture as mic — helps later autoplay. */
+    function unlockPlaybackInGesture() {
+      const ctx = getAudioContext();
+      if (ctx && ctx.state === "suspended") ctx.resume().catch(() => {});
+    }
+
+    function micErrorMessage(err) {
+      const name = err && err.name;
+      const msg = String((err && err.message) || err || "");
+      if (name === "NotAllowedError" || /permission|dismissed|denied/i.test(msg)) {
+        return (
+          "Microphone was blocked or the prompt was dismissed. " +
+          "Click the lock/site icon → allow Microphone → reload. " +
+          "Prefer opening http://127.0.0.1:8765/ (FastAPI) instead of a static file server."
+        );
+      }
+      if (name === "NotFoundError" || /no device|not found/i.test(msg))
+        return "No microphone found. Plug in a mic or enable the built-in mic.";
+      if (name === "NotReadableError" || /could not start/i.test(msg))
+        return "Microphone is in use by another app. Close other apps using the mic and try again.";
+      return msg || "Could not access the microphone.";
+    }
+
+    async function ensureMic() {
+      if (!navigator.mediaDevices?.getUserMedia) {
+        throw new Error("getUserMedia is not supported in this browser");
+      }
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true },
+      });
+      const mime = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+        ? "audio/webm;codecs=opus"
+        : "audio/webm";
+      mediaRecorder = new MediaRecorder(stream, { mimeType: mime });
+      chunks = [];
+      mediaRecorder.ondataavailable = (e) => {
+        if (e.data.size > 0) chunks.push(e.data);
+      };
+      return mime;
+    }
+
+    function extForMime(mime) {
+      const t = (mime || "").toLowerCase();
+      if (t.includes("webm")) return "webm";
+      if (t.includes("ogg")) return "ogg";
+      if (t.includes("mp4") || t.includes("mpeg") || t.includes("aac")) return "m4a";
+      return "webm";
+    }
+
+    function sleep(ms) {
+      return new Promise((r) => setTimeout(r, ms));
+    }
+
+    async function sendBlob(blob) {
+      const fd = new FormData();
+      const ext = extForMime(blob.type);
+      fd.append("audio", blob, `speech.${ext}`);
+      const res = await fetch(apiUrl("/api/voice-chat"), { method: "POST", body: fd });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const d = data.detail;
+        const msg =
+          typeof d === "string"
+            ? d
+            : Array.isArray(d)
+              ? d.map((x) => x.msg || x).join("; ")
+              : JSON.stringify(data);
+        throw new Error(msg || res.statusText || "Request failed");
+      }
+      return data;
+    }
+
+    /** Play WAV: Web Audio for immediate playback; HTML audio gets the same blob for replay. */
+    async function playWavAuto(wavBytes) {
+      const url = URL.createObjectURL(new Blob([wavBytes], { type: "audio/wav" }));
+      if (player.src) URL.revokeObjectURL(player.src);
+      player.src = url;
+
+      const ctx = getAudioContext();
+      if (ctx) {
+        try {
+          const ab = wavBytes.buffer.slice(wavBytes.byteOffset, wavBytes.byteOffset + wavBytes.byteLength);
+          const buffer = await ctx.decodeAudioData(ab);
+          const src = ctx.createBufferSource();
+          src.buffer = buffer;
+          src.connect(ctx.destination);
+          src.start(0);
+          return;
+        } catch (_) {
+          /* fall through to element playback */
+        }
+      }
+      try {
+        await player.play();
+      } catch (_) {
+        setStatus("Tap the play control to hear the reply.", true);
+      }
+    }
+
+    btn.addEventListener("pointerdown", async (e) => {
+      if (e.button !== undefined && e.button !== 0) return;
+      e.preventDefault();
+      try {
+        setStatus("Recording…");
+        btn.classList.add("recording");
+        btn.setAttribute("aria-pressed", "true");
+        unlockPlaybackInGesture();
+        try {
+          if (btn.setPointerCapture) btn.setPointerCapture(e.pointerId);
+          recordingPointerId = e.pointerId;
+        } catch (_) {}
+        await ensureMic();
+        chunks = [];
+        mediaRecorder.start(250);
+      } catch (err) {
+        setStatus(micErrorMessage(err), true);
+        btn.classList.remove("recording");
+        btn.setAttribute("aria-pressed", "false");
+        try {
+          if (recordingPointerId != null) btn.releasePointerCapture(recordingPointerId);
+        } catch (_) {}
+        recordingPointerId = null;
+      }
+    });
+
+    async function stopRecordingAndSend() {
+      if (stopInFlight) return;
+      if (!mediaRecorder || mediaRecorder.state === "inactive") return;
+      stopInFlight = true;
+      try {
+        setStatus("Processing…");
+        btn.classList.remove("recording");
+        btn.setAttribute("aria-pressed", "false");
+        try {
+          if (recordingPointerId != null) btn.releasePointerCapture(recordingPointerId);
+        } catch (_) {}
+        recordingPointerId = null;
+
+        if (mediaRecorder.state === "recording") {
+          try {
+            mediaRecorder.requestData();
+          } catch (_) {}
+          await sleep(200);
+        }
+        mediaRecorder.stop();
+        await new Promise((r) => {
+          mediaRecorder.onstop = r;
+        });
+        const blob = new Blob(chunks, { type: mediaRecorder.mimeType });
+        mediaRecorder.stream.getTracks().forEach((t) => t.stop());
+        mediaRecorder = null;
+
+        const out = await sendBlob(blob);
+        transcriptEl.textContent = out.transcript || "—";
+        replyEl.textContent = out.reply || "—";
+        const bin = atob(out.audio_wav_base64);
+        const buf = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+        await playWavAuto(buf);
+        setStatus("Done.");
+      } catch (err) {
+        setStatus(String(err.message || err), true);
+      } finally {
+        stopInFlight = false;
+      }
+    }
+
+    btn.addEventListener("pointerup", (e) => {
+      if (e.button !== undefined && e.button !== 0) return;
+      stopRecordingAndSend();
+    });
+
+    btn.addEventListener("pointercancel", () => {
+      stopRecordingAndSend();
+    });
+
+    btnPdfUpload.addEventListener("click", async () => {
+      const f = pdfFile.files && pdfFile.files[0];
+      if (!f) {
+        ragMeta.textContent = "Choose a PDF file first.";
+        return;
+      }
+      btnPdfUpload.disabled = true;
+      ragMeta.textContent = "Uploading and indexing…";
+      try {
+        const fd = new FormData();
+        fd.append("file", f, f.name);
+        let url = apiUrl("/api/rag/upload");
+        if (ragReplace.checked) url += (url.includes("?") ? "&" : "?") + "replace=true";
+        const res = await fetch(url, { method: "POST", body: fd });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          const d = data.detail;
+          const msg = typeof d === "string" ? d : JSON.stringify(data);
+          throw new Error(msg || res.statusText);
+        }
+        ragMeta.textContent = `Indexed ${data.chunks_added} chunks from “${data.source}”. Total in index: ${data.total_chunks}.`;
+        ragReplace.checked = false;
+        fetch(apiUrl("/api/health"))
+          .then((r) => r.json())
+          .then((h) => {
+            if (h.groq_configured && h.ffmpeg)
+              setStatus((API_BASE ? `API: ${API_BASE}` : "Ready") + ` · RAG chunks: ${h.rag_chunks}`);
+          })
+          .catch(() => {});
+      } catch (e) {
+        ragMeta.textContent = String(e.message || e);
+      } finally {
+        btnPdfUpload.disabled = false;
+      }
+    });
+
+    fetch(apiUrl("/api/health"))
+      .then((r) => r.json())
+      .then((h) => {
+        if (!h.groq_configured)
+          setStatus("Warning: GROQ_LLM_API_KEY not configured on the API server.", true);
+        else if (!h.ffmpeg)
+          setStatus(
+            "Warning: ffmpeg not found on server — install it or Groq may reject WebM. brew install ffmpeg",
+            true
+          );
+        else {
+          const rag = typeof h.rag_chunks === "number" ? h.rag_chunks : "?";
+          setStatus(
+            (API_BASE ? `API: ${API_BASE}` : "Ready") + ` · RAG chunks indexed: ${rag}`
+          );
+        }
+      })
+      .catch(() =>
+        setStatus(
+          "Could not reach the API at " + (apiUrl("/api/health") || "/api/health") + ". Start uvicorn on port 8765.",
+          true
+        )
+      );
+  </script>
+</body>
+</html>
